@@ -1,0 +1,24 @@
+<!--
+  Label Studio labeling configuration for construction-site OBJECT DETECTION.
+
+  HOW TO ADD A NEW CLASS MID-ANNOTATION:
+    1. Edit this file (add a <Label .../> line) OR edit it directly in the
+       Label Studio UI:  Project > Settings > Labeling Interface.
+    2. Keep annotating. The ML backend reads the *current* class list from the
+       project every time it retrains, so the new class is picked up automatically
+       on the next 25-image retrain cycle (the model head is rebuilt to match).
+
+  The `value` of each <Label> is the class name used for training.
+-->
+<View>
+  <Image name="image" value="$image" zoom="true" zoomControl="true" rotateControl="false"/>
+  <RectangleLabels name="label" toName="image">
+    <Label value="excavator"      background="#e6194b"/>
+    <Label value="dump_truck"     background="#3cb44b"/>
+    <Label value="crane"          background="#4363d8"/>
+    <Label value="worker"         background="#f58231"/>
+    <Label value="concrete_pipe"  background="#911eb4"/>
+    <Label value="building"       background="#46f0f0"/>
+    <Label value="vehicle"        background="#f032e6"/>
+  </RectangleLabels>
+</View>

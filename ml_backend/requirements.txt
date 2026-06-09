@@ -1,0 +1,16 @@
+# Install PyTorch + torchvision SEPARATELY first with the CUDA index so you get
+# GPU wheels (see SETUP.md):
+#
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+#
+# Then:  pip install -r ml_backend/requirements.txt
+#
+# NOTE: no Ultralytics / no pretrained detector here on purpose. The model is a
+# custom architecture defined from raw PyTorch layers and trained from scratch
+# (random init). See ml_backend/model_arch.py and TRAINING.md.
+label-studio-ml>=1.0.9
+label-studio-sdk>=1.0.5
+requests>=2.31.0
+PyYAML>=6.0
+pillow>=10.0
+numpy>=1.26

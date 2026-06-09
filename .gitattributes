@@ -1,0 +1,25 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Shell scripts MUST stay LF or bash won't run them (even on Windows checkouts).
+*.sh    text eol=lf
+
+# PowerShell is happiest with CRLF on Windows.
+*.ps1   text eol=crlf
+
+# Normal text files: let git normalize line endings.
+*.py    text
+*.md    text
+*.xml   text
+*.txt   text
+*.json  text
+*.yaml  text
+*.yml   text
+
+# Binary assets: never normalize / never diff as text.
+*.jpeg  binary
+*.jpg   binary
+*.png   binary
+*.pt    binary
+*.pth   binary
+*.onnx  binary

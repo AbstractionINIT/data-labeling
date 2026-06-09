@@ -1,0 +1,49 @@
+# ---- Python virtual environment --------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+
+# ---- Python bytecode / caches ----------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# ---- Runtime / generated training data -------------------------------------
+# Recreated automatically by the backend on first train.
+data/
+# Model weights / checkpoints (also covered by data/, kept here for safety)
+*.pt
+*.pth
+*.onnx
+
+# ---- Logs ------------------------------------------------------------------
+*.log
+data/logs/
+
+# ---- Secrets ---------------------------------------------------------------
+# These hold your Label Studio access token after you edit them — do NOT commit.
+# Committed templates live alongside them: scripts/env.example.ps1 / .sh
+# On a fresh clone:  copy env.example.ps1 -> env.ps1  (or env.example.sh -> env.sh)
+scripts/env.ps1
+scripts/env.sh
+.env
+
+# ---- OS cruft --------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Editor / IDE ----------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---- Source images ---------------------------------------------------------
+# The 158 jpegs are ~300 MB; kept out of git history.
+images/
