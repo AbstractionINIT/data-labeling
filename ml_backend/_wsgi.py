@@ -30,4 +30,6 @@ app = init_app(model_class=ScratchDetBackend, model_dir=MODEL_DIR)
 
 if __name__ == "__main__":
     port = int(os.getenv("ML_PORT", "9090"))
-    app.run(host="0.0.0.0", port=port, debug=True, use_reloader=False)
+    # threaded=True so the post-train auto-refresh (which calls back into /predict
+    # on this same server) and dashboard health polls are served concurrently.
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True, use_reloader=False)

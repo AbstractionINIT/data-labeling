@@ -18,6 +18,12 @@ export DET_BATCH="8"
 export DET_EPOCHS="0"          # 0 = auto-scale by dataset size
 export DET_LR="2e-3"
 
+# SAHI-style sliced inference — recommended for the large panoramas (~7571x2619):
+# detects on overlapping tiles so small objects aren't lost in the 512px downscale.
+export DET_SLICED="1"          # 1 = on, 0 = single-pass whole-image inference
+export DET_SLICE="1024"        # tile size in original pixels
+export DET_SLICE_OVERLAP="0.2" # fractional tile overlap (0..1)
+
 # Force a device if auto-detect is wrong:  cuda | dml | cpu
 # export FORCE_DEVICE="cuda"
 

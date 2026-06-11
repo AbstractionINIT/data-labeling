@@ -15,6 +15,21 @@ $root = Split-Path -Parent $PSScriptRoot
 & "$root\.venv\Scripts\Activate.ps1"
 
 $port = "8090"
+
+# Detect the primary LAN IPv4 so Label Studio is reachable from other devices.
+# (waitress already binds 0.0.0.0; HOST must be the LAN IP or links/CSS/CSRF
+# break when opened from another machine.)
+$lanip = $env:LAN_IP
+if (-not $lanip) {
+  $lanip = (Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null -and $_.NetAdapter.Status -eq 'Up' } |
+            Select-Object -First 1).IPv4Address.IPAddress
+}
+if (-not $lanip) {
+  $lanip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object {
+            $_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -notlike '169.254.*' -and
+            $_.PrefixOrigin -in 'Dhcp','Manual' } | Select-Object -First 1).IPAddress
+}
+if (-not $lanip) { $lanip = "localhost" }
 # NOTE: Label Studio prefers the LABEL_STUDIO_-prefixed vars and they OVERRIDE
 # the unprefixed ones. A leftover user/registry var
 # (LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT) can otherwise force the wrong folder,
@@ -24,11 +39,15 @@ $env:LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT   = $root
 $env:LOCAL_FILES_SERVING_ENABLED = "true"
 $env:LOCAL_FILES_DOCUMENT_ROOT   = $root
 $env:LABEL_STUDIO_BASE_DATA_DIR  = "$root\data\.ls-data"
-$env:LABEL_STUDIO_HOST           = "http://localhost:$port"
+$env:LABEL_STUDIO_HOST           = "http://${lanip}:$port"
 $env:LS_PORT    = $port
 $env:LS_THREADS = "8"
 
-Write-Host "Starting Label Studio (waitress) on http://localhost:$port"
-Write-Host "  doc root : $root"
-Write-Host "  database : $env:LABEL_STUDIO_BASE_DATA_DIR"
+Write-Host "Starting Label Studio (waitress) - served on the local network" -ForegroundColor Green
+Write-Host "  this machine : http://localhost:$port"
+Write-Host "  on your LAN  : http://${lanip}:$port   (open this from other devices)" -ForegroundColor Cyan
+Write-Host "  doc root     : $root"
+Write-Host "  database     : $env:LABEL_STUDIO_BASE_DATA_DIR"
+Write-Host "  NOTE: if other devices cannot connect, allow the port through the firewall (Admin):" -ForegroundColor DarkGray
+Write-Host "    New-NetFirewallRule -DisplayName 'Label Studio $port' -Direction Inbound -LocalPort $port -Protocol TCP -Action Allow -Profile Private" -ForegroundColor DarkGray
 & "$root\.venv\Scripts\python.exe" "$root\scripts\serve_ls.py"

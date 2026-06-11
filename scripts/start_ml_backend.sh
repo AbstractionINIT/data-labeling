@@ -9,6 +9,13 @@ else
   VPY="$ROOT/.venv/Scripts/python.exe"
 fi
 
+PORT="${ML_PORT:-9090}"
+LANIP="${LAN_IP:-}"
+if [ -z "$LANIP" ]; then LANIP="$(hostname -I 2>/dev/null | awk '{print $1}')"; fi
+if [ -z "$LANIP" ]; then LANIP="localhost"; fi
+
 cd "$ROOT/ml_backend"
-echo "Starting detector ML backend on ${ML_BACKEND_URL:-http://localhost:9090}"
+echo "Starting from-scratch detector ML backend — served on the local network"
+echo "  this machine : http://localhost:$PORT"
+echo "  on your LAN  : http://$LANIP:$PORT"
 "$VPY" _wsgi.py

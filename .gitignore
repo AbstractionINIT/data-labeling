@@ -48,5 +48,11 @@ desktop.ini
 # The 158 jpegs are ~300 MB; kept out of git history.
 images/
 
+# ---- Dropped-in pre-existing annotations -----------------------------------
+# Paste your own images + labels here; merged into training automatically.
+# Ignore the contents (can be large) but keep the explanatory README.
+extra_data/*
+!extra_data/README.md
+
 # ---- This project's dedicated Label Studio instance DB ----
 data/.ls-data/

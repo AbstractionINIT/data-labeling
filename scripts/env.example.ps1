@@ -18,6 +18,12 @@ $env:DET_BATCH    = "8"       # fits 8 GB VRAM at 512
 $env:DET_EPOCHS   = "0"       # 0 = auto-scale epochs by dataset size
 $env:DET_LR       = "2e-3"
 
+# SAHI-style sliced inference — recommended for the large panoramas (~7571x2619):
+# detects on overlapping tiles so small objects aren't lost in the 512px downscale.
+$env:DET_SLICED        = "1"      # 1 = on, 0 = single-pass whole-image inference
+$env:DET_SLICE         = "1024"   # tile size in original pixels
+$env:DET_SLICE_OVERLAP = "0.2"    # fractional tile overlap (0..1)
+
 # NOTE: do NOT set LABEL_STUDIO_HOST here. It must equal the server's own
 # host:port or the UI loads CSS/JS from the wrong port (blank/unstyled page).
 # The start script sets it correctly for the 8081 instance.

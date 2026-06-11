@@ -143,7 +143,12 @@ class ScratchDetBackend(LabelStudioMLBase):
                     continue
                 img = Image.open(local).convert("RGB")
                 w, h = img.size
-                dets = D.predict_boxes(weights, img, conf=0.25, iou=0.45)
+                inf = D.load_inference()       # live SAHI config (dashboard-adjustable)
+                dets = (D.predict_boxes_sliced(weights, img, conf=0.25, iou=0.45,
+                                               slice_size=int(inf["slice"]),
+                                               overlap=float(inf["overlap"]))
+                        if inf.get("sliced") else
+                        D.predict_boxes(weights, img, conf=0.25, iou=0.45))
                 items, scores = [], []
                 for cls_id, score, x1, y1, x2, y2 in dets:
                     name = classes[cls_id] if cls_id < len(classes) else str(cls_id)
@@ -243,6 +248,14 @@ class ScratchDetBackend(LabelStudioMLBase):
         state = D.train(samples, classes, state)
         state["events_since_train"] = 0          # reset the counter after training
         D.save_state(state)
+
+        # Push the fresh model's predictions into Label Studio automatically:
+        # point the project at the new version and re-fetch every task. Done in a
+        # background thread so this webhook returns first (the re-fetch calls back
+        # into /predict on this same backend).
+        version = f"scratchdet-r{state.get('train_runs', 0)}"
+        self._spawn_refresh(project_id, version)
+
         return {
             "status": "trained",
             "images": completed,
@@ -250,4 +263,40 @@ class ScratchDetBackend(LabelStudioMLBase):
             "classes": classes,
             "metrics": state["last_metrics"],
             "weights": state["active_weights"],
+            "model_version": version,
         }
+
+    # ------------------------------------------------------------------ #
+    # Auto-refresh predictions in Label Studio after a retrain
+    # ------------------------------------------------------------------ #
+    def _spawn_refresh(self, project_id: int, version: str):
+        def work():
+            try:
+                time.sleep(1.0)   # let fit() return so the worker is free
+                h = {"Authorization": f"Token {LS_API_KEY}", "Content-Type": "application/json"}
+                sel = {"selectedItems": {"all": True, "excluded": []}}
+                requests.patch(f"{LS_URL}/api/projects/{project_id}", headers=h,
+                               json={"model_version": version}, timeout=30)
+                # Clear old predictions first so the fresh model's boxes actually
+                # replace them (LS dedupes by model_version) and stale versions
+                # don't accumulate.
+                requests.post(f"{LS_URL}/api/dm/actions",
+                              params={"id": "delete_tasks_predictions", "project": project_id},
+                              headers=h, json=sel, timeout=300)
+                requests.post(f"{LS_URL}/api/dm/actions",
+                              params={"id": "retrieve_tasks_predictions", "project": project_id},
+                              headers=h, json=sel, timeout=900)
+                log.info(f"  auto-refreshed Label Studio predictions -> {version}")
+            except Exception as e:
+                log.warning(f"  auto-refresh of predictions failed ({e}); "
+                            f"run scripts/refresh_predictions.* to do it manually")
+        threading.Thread(target=work, daemon=True).start()
+
+
+# Seed data/inference.json from env defaults on first run (preserves any values
+# already set from the dashboard). The dashboard reads + writes this file to show
+# and adjust SAHI sliced inference live.
+try:
+    D.save_inference(D.load_inference())
+except Exception:
+    pass

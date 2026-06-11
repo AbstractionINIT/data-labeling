@@ -53,6 +53,13 @@ BATCH = int(os.getenv("DET_BATCH", "8"))
 BASE_EPOCHS = int(os.getenv("DET_EPOCHS", "0"))      # 0 = auto-scale by data size
 LR = float(os.getenv("DET_LR", "2e-3"))
 
+# ---- SAHI-style sliced inference (for very large / panoramic images) ------- #
+# These construction panoramas are ~7571x2619; a single 512px pass downsamples
+# ~15x and loses small objects. Slicing detects on overlapping tiles instead.
+SLICED = os.getenv("DET_SLICED", "1").lower() not in ("0", "", "false", "no", "off")
+SLICE_SIZE = int(os.getenv("DET_SLICE", "1024"))     # tile size in original px
+SLICE_OVERLAP = float(os.getenv("DET_SLICE_OVERLAP", "0.2"))   # 0..1 tile overlap
+
 
 # --------------------------------------------------------------------------- #
 # State
@@ -75,6 +82,43 @@ def load_state() -> dict:
 def save_state(state: dict) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     STATE_PATH.write_text(json.dumps(state, indent=2))
+
+
+# --------------------------------------------------------------------------- #
+# Runtime inference config (SAHI) — adjustable live from the dashboard.
+# Kept in its OWN file so dashboard writes never race the trainer's state.json.
+# --------------------------------------------------------------------------- #
+INFERENCE_PATH = DATA_DIR / "inference.json"
+
+
+def load_inference() -> dict:
+    """Effective sliced-inference config: data/inference.json over env defaults."""
+    cfg = {"sliced": SLICED, "slice": SLICE_SIZE, "overlap": SLICE_OVERLAP}
+    if INFERENCE_PATH.exists():
+        try:
+            saved = json.loads(INFERENCE_PATH.read_text(encoding="utf-8"))
+            for k in cfg:
+                if k in saved:
+                    cfg[k] = saved[k]
+        except Exception:
+            pass
+    return cfg
+
+
+def save_inference(cfg: dict) -> dict:
+    """Merge + persist inference config; returns the new effective config."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    cur = load_inference()
+    if "sliced" in cfg:
+        cur["sliced"] = bool(cfg["sliced"])
+    if "slice" in cfg:
+        cur["slice"] = max(256, min(8192, int(cfg["slice"])))
+    if "overlap" in cfg:
+        cur["overlap"] = max(0.0, min(0.8, float(cfg["overlap"])))
+    tmp = INFERENCE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cur, indent=2), encoding="utf-8")
+    tmp.replace(INFERENCE_PATH)
+    return cur
 
 
 # --------------------------------------------------------------------------- #
@@ -505,3 +549,55 @@ def predict_boxes(weights_path: str, img: Image.Image, conf=0.25, iou=0.45):
             out.append((int(c), float(scores[sel][k]),
                         max(0, ox1), max(0, oy1), min(ow, ox2), min(oh, oy2)))
     return out
+
+
+def _merge_dets(dets, iou):
+    """Global per-class NMS over detections already in original-image pixels."""
+    if not dets:
+        return []
+    boxes = torch.tensor([[d[2], d[3], d[4], d[5]] for d in dets], dtype=torch.float32)
+    scores = torch.tensor([d[1] for d in dets], dtype=torch.float32)
+    classes = torch.tensor([d[0] for d in dets])
+    out = []
+    for c in classes.unique():
+        sel = classes == c
+        bsel, ssel = boxes[sel], scores[sel]
+        for k in nms(bsel, ssel, iou):
+            x1, y1, x2, y2 = bsel[k].tolist()
+            out.append((int(c), float(ssel[k]), x1, y1, x2, y2))
+    return out
+
+
+@torch.no_grad()
+def predict_boxes_sliced(weights_path: str, img: Image.Image, conf=0.25, iou=0.45,
+                         slice_size=None, overlap=None, include_full=True):
+    """SAHI-style sliced inference for large images.
+
+    Tile the image into overlapping windows, run the detector on each (where a
+    small object spans enough pixels to survive the 512px letterbox), then merge
+    all tiles' detections with one global per-class NMS. A final full-image pass
+    catches objects bigger than a single tile.
+    """
+    W, H = img.size
+    sz = int(slice_size or SLICE_SIZE)
+    ov = SLICE_OVERLAP if overlap is None else overlap
+    if W <= sz and H <= sz:                      # small image -> no point slicing
+        return predict_boxes(weights_path, img, conf=conf, iou=iou)
+
+    step = max(1, int(sz * (1 - ov)))
+    xs = list(range(0, max(1, W - sz + 1), step)) or [0]
+    ys = list(range(0, max(1, H - sz + 1), step)) or [0]
+    if xs[-1] + sz < W:
+        xs.append(max(0, W - sz))                # make the last tile hit the edge
+    if ys[-1] + sz < H:
+        ys.append(max(0, H - sz))
+
+    dets = []
+    for y0 in ys:
+        for x0 in xs:
+            crop = img.crop((x0, y0, min(x0 + sz, W), min(y0 + sz, H)))
+            for cl, sc, a, b, c2, d in predict_boxes(weights_path, crop, conf=conf, iou=iou):
+                dets.append((cl, sc, a + x0, b + y0, c2 + x0, d + y0))
+    if include_full:
+        dets.extend(predict_boxes(weights_path, img, conf=conf, iou=iou))
+    return _merge_dets(dets, iou)

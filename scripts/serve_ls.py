@@ -53,6 +53,20 @@ from django.core.wsgi import get_wsgi_application  # noqa: E402
 from waitress import serve  # noqa: E402
 from whitenoise import WhiteNoise  # noqa: E402
 
+# --- Local-network access -------------------------------------------------- #
+# Accept any Host header and trust the configured HOST (the LAN IP set by the
+# start script) plus localhost for CSRF, so annotating from another device on
+# the network doesn't fail the CSRF/Host checks.
+settings.ALLOWED_HOSTS = ["*"]
+_origins = set(getattr(settings, "CSRF_TRUSTED_ORIGINS", []) or [])
+_host = os.environ.get("LABEL_STUDIO_HOST", "").rstrip("/")
+if _host:
+    _origins.add(_host)
+_lsport = os.environ.get("LS_PORT", "8090")
+for _h in ("localhost", "127.0.0.1"):
+    _origins.add(f"http://{_h}:{_lsport}")
+settings.CSRF_TRUSTED_ORIGINS = sorted(_origins)
+
 # Ensure DB schema is current and static files exist (cheap if already done).
 call_command("migrate", "--noinput", verbosity=0)
 if not os.path.isdir(settings.STATIC_ROOT) or not os.listdir(settings.STATIC_ROOT):

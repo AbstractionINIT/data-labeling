@@ -28,17 +28,26 @@ from __future__ import annotations
 import json
 import os
 import re
+import statistics
+import threading
+import time
 from pathlib import Path
 
 import requests
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BACKEND_DIR / "data"
+IMAGES_DIR = BACKEND_DIR / "images"
 STATE_PATH = DATA_DIR / "state.json"
 HISTORY_PATH = DATA_DIR / "history.json"
+PROGRESS_PATH = DATA_DIR / "progress.json"
+INFERENCE_PATH = DATA_DIR / "inference.json"
 LOG_PATH = DATA_DIR / "logs" / "training.log"
 CKPT_DIR = DATA_DIR / "checkpoints"
+PROGRESS_STALE = 25.0   # seconds before a progress section reads as inactive
+IMG_INPUT = int(os.getenv("DET_IMG_SIZE", "512"))   # model input size (for recommend)
+DEFAULT_INFERENCE = {"sliced": True, "slice": 1024, "overlap": 0.2}
 
 LS_URL = os.getenv("LABEL_STUDIO_URL", "http://localhost:8090").rstrip("/")
 LS_KEY = os.getenv("LABEL_STUDIO_API_KEY", "")
@@ -182,6 +191,83 @@ def _runs():
     return summaries, curves, per_class, tail
 
 
+def _inference():
+    """Live SAHI config from data/inference.json (falls back to defaults)."""
+    cfg = dict(DEFAULT_INFERENCE)
+    if INFERENCE_PATH.exists():
+        try:
+            saved = json.loads(INFERENCE_PATH.read_text(encoding="utf-8"))
+            for k in cfg:
+                if k in saved:
+                    cfg[k] = saved[k]
+        except Exception:
+            pass
+    return cfg
+
+
+def _write_inference(updates: dict):
+    """Validate + merge + persist SAHI config; returns the new effective config."""
+    cfg = _inference()
+    if "sliced" in updates:
+        cfg["sliced"] = bool(updates["sliced"])
+    if "slice" in updates:
+        cfg["slice"] = max(256, min(8192, int(updates["slice"])))
+    if "overlap" in updates:
+        cfg["overlap"] = max(0.0, min(0.8, round(float(updates["overlap"]), 3)))
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = INFERENCE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    tmp.replace(INFERENCE_PATH)
+    return cfg
+
+
+def _median_image_size():
+    sizes = []
+    if IMAGES_DIR.exists():
+        from PIL import Image
+        for p in sorted(IMAGES_DIR.glob("*"))[:24]:
+            try:
+                with Image.open(p) as im:
+                    sizes.append(im.size)
+            except Exception:
+                pass
+    if not sizes:
+        return None
+    return int(statistics.median(s[0] for s in sizes)), int(statistics.median(s[1] for s in sizes))
+
+
+def _recommend_slice():
+    """Recommend SAHI config from the current images (adapts if they change)."""
+    wh = _median_image_size()
+    if not wh:
+        return None, None
+    W, H = wh
+    short, longd = min(W, H), max(W, H)
+    if longd <= IMG_INPUT * 1.5:           # already near model input -> no slicing
+        return {"sliced": False, "slice": DEFAULT_INFERENCE["slice"], "overlap": 0.2}, wh
+    # aim for ~2x downscale into the model input: tile ~= half the short side,
+    # snapped to a multiple of 128 and clamped to a sane range.
+    sl = int(round(short / 2 / 128) * 128)
+    sl = max(IMG_INPUT, min(2048, sl))
+    return {"sliced": True, "slice": sl, "overlap": 0.2}, wh
+
+
+def _progress():
+    """Live train/infer progress, filtered to recently-updated sections."""
+    try:
+        d = json.loads(PROGRESS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    now = time.time()
+    out = {}
+    for k in ("train", "infer"):
+        s = d.get(k)
+        if s and (now - s.get("updated", 0) < PROGRESS_STALE):
+            s = dict(s); s.pop("updated", None)
+            out[k] = s
+    return out
+
+
 def _checkpoints():
     out = []
     if CKPT_DIR.exists():
@@ -213,6 +299,7 @@ def status():
         "active_weights": weights,
         "serving": serving,
         "model_version": f"scratchdet-r{state.get('train_runs', 0)}" if serving else None,
+        "inference": _inference(),
         "last_metrics": state.get("last_metrics", {}),
         "annotated_images": proj.get("annotated_images"),
         "total_annotations": proj.get("total_annotations"),
@@ -220,6 +307,7 @@ def status():
         "tasks": proj.get("tasks"),
         "auto_predict": proj.get("auto_predict"),
         "project_id": proj.get("id"),
+        "progress": _progress(),
         "runs": summaries,
         "curves": curves,
         "per_class": per_class,
@@ -229,6 +317,76 @@ def status():
         "ml_url": ML_URL,
         "ls_port": LS_URL.rsplit(":", 1)[-1] if ":" in LS_URL else "8090",
     })
+
+
+@app.route("/api/train", methods=["POST"])
+def api_train():
+    """Force a retrain now (ignores the every-25 gate). When it finishes, the
+    backend auto-pushes the new predictions into Label Studio."""
+    proj = _ls_project()
+    pid = proj.get("id")
+    if not pid:
+        return jsonify({"ok": False, "error": "project not found in Label Studio"}), 400
+
+    def work():
+        try:
+            requests.post(f"{ML_URL}/webhook",
+                          json={"action": "START_TRAINING", "project": {"id": pid}},
+                          timeout=3600)
+        except Exception:
+            pass
+    threading.Thread(target=work, daemon=True).start()
+    return jsonify({"ok": True, "status": "training started"})
+
+
+@app.route("/api/refresh", methods=["POST"])
+def api_refresh():
+    """Re-push the current model's predictions into Label Studio (delete stale +
+    re-fetch) without retraining."""
+    if not LS_KEY:
+        return jsonify({"ok": False, "error": "LABEL_STUDIO_API_KEY not set"}), 400
+    proj = _ls_project()
+    pid = proj.get("id")
+    state = json.loads(STATE_PATH.read_text()) if STATE_PATH.exists() else {}
+    runs = state.get("train_runs", 0)
+    if not pid or runs < 1:
+        return jsonify({"ok": False, "error": "no project or no trained model yet"}), 400
+    version = f"scratchdet-r{runs}"
+    h = {"Authorization": f"Token {LS_KEY}", "Content-Type": "application/json"}
+    sel = {"selectedItems": {"all": True, "excluded": []}}
+
+    def work():
+        try:
+            requests.patch(f"{LS_URL}/api/projects/{pid}", headers=h,
+                           json={"model_version": version}, timeout=30)
+            requests.post(f"{LS_URL}/api/dm/actions",
+                          params={"id": "delete_tasks_predictions", "project": pid},
+                          headers=h, json=sel, timeout=300)
+            requests.post(f"{LS_URL}/api/dm/actions",
+                          params={"id": "retrieve_tasks_predictions", "project": pid},
+                          headers=h, json=sel, timeout=900)
+        except Exception:
+            pass
+    threading.Thread(target=work, daemon=True).start()
+    return jsonify({"ok": True, "status": f"refreshing to {version}"})
+
+
+@app.route("/api/sahi", methods=["POST"])
+def api_sahi():
+    """Update SAHI sliced-inference settings live (applies to next prediction)."""
+    body = request.get_json(force=True, silent=True) or {}
+    cfg = _write_inference(body)
+    return jsonify({"ok": True, "inference": cfg})
+
+
+@app.route("/api/sahi/recommend", methods=["POST"])
+def api_sahi_recommend():
+    """Compute + apply a recommended slice size from the current images."""
+    rec, wh = _recommend_slice()
+    if not rec:
+        return jsonify({"ok": False, "error": "no images found to measure"}), 400
+    cfg = _write_inference(rec)
+    return jsonify({"ok": True, "inference": cfg, "median_image": list(wh)})
 
 
 @app.route("/")
@@ -290,16 +448,62 @@ pre{background:var(--bg2);border:1px solid var(--bd);border-radius:8px;padding:1
  font:12px/1.55 ui-monospace,"Cascadia Code",Consolas,monospace;margin:0;white-space:pre-wrap;color:#c9d1d9}
 a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 .muted{color:var(--mut)}.dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:6px}
+/* live progress banner */
+.live{display:flex;flex-direction:column;gap:10px;margin-bottom:16px}
+.pcard{background:linear-gradient(180deg,#16203a,#121826);border:1px solid #2b3a55;border-radius:12px;padding:13px 16px}
+.pcard .top{display:flex;align-items:center;gap:10px;font-size:13px;margin-bottom:9px}
+.pcard .top b{font-weight:700}.pcard .top .pct{margin-left:auto;font-weight:700;font-size:15px}
+.pcard .top .live-dot{width:9px;height:9px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 0 rgba(63,185,80,.6);animation:pulse 1.4s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(63,185,80,.55)}70%{box-shadow:0 0 0 9px rgba(63,185,80,0)}100%{box-shadow:0 0 0 0 rgba(63,185,80,0)}}
+.pbar{height:14px;background:#0a0e14;border:1px solid #21262d;border-radius:8px;overflow:hidden}
+.pbar>div{height:100%;border-radius:8px 0 0 8px;transition:width .5s;
+ background-image:linear-gradient(90deg,var(--accent2),var(--accent)),linear-gradient(45deg,rgba(255,255,255,.14) 25%,transparent 25%,transparent 50%,rgba(255,255,255,.14) 50%,rgba(255,255,255,.14) 75%,transparent 75%);
+ background-size:auto,22px 22px;background-blend-mode:overlay;animation:stripe 1s linear infinite}
+.pbar.infer>div{background-image:linear-gradient(90deg,#1f7a4d,#39c5cf),linear-gradient(45deg,rgba(255,255,255,.14) 25%,transparent 25%,transparent 50%,rgba(255,255,255,.14) 50%,rgba(255,255,255,.14) 75%,transparent 75%)}
+@keyframes stripe{from{background-position:0 0,0 0}to{background-position:0 0,22px 0}}
+.pcard .sub{color:var(--mut);font-size:12px;margin-top:7px;display:flex;gap:16px;flex-wrap:wrap}
+/* action buttons */
+.actions{display:flex;align-items:center;gap:10px;margin-bottom:16px;flex-wrap:wrap}
+.btn{background:linear-gradient(180deg,#238636,#1f7a31);color:#fff;border:1px solid #2ea043;border-radius:9px;
+ padding:9px 16px;font-size:13px;font-weight:600;cursor:pointer;transition:filter .15s}
+.btn:hover{filter:brightness(1.12)}.btn:active{filter:brightness(.95)}
+.btn:disabled{opacity:.5;cursor:not-allowed;filter:grayscale(.4)}
+.btn.ghost{background:linear-gradient(180deg,#21262d,#181d24);border-color:var(--bd);color:var(--fg)}
+.btn.sm{padding:6px 12px;font-size:12px}
+#actmsg{font-size:12.5px}
+/* SAHI control bar */
+.sahibar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;background:var(--card);border:1px solid var(--bd);
+ border-radius:10px;padding:10px 14px;margin-bottom:16px;font-size:13px}
+.sahibar .lbl{font-weight:700;color:var(--accent)}
+.sahibar .sw{display:flex;align-items:center;gap:6px;cursor:pointer}
+.sahibar .num{width:78px;background:#0d1117;color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:5px 8px;font-size:13px}
+#saMsg{font-size:12.5px}
 </style></head><body>
 <header>
   <div class="logo">🏗️ ScratchDet<small>from-scratch detector · live training dashboard</small></div>
   <span id="ver" class="badge ver" style="display:none"></span>
+  <span id="sahi" class="badge" style="display:none"></span>
   <div class="spacer"></div>
   <span id="ls" class="badge down">Label Studio …</span>
   <span id="ml" class="badge down">ML backend …</span>
   <span class="upd" id="upd"></span>
 </header>
 <div class="wrap">
+  <div class="actions">
+    <button id="btnTrain" class="btn">⚡ Force train now</button>
+    <button id="btnRefresh" class="btn ghost">⟳ Refresh predictions in LS</button>
+    <span id="actmsg" class="muted"></span>
+  </div>
+  <div class="sahibar">
+    <span class="lbl">SAHI inference</span>
+    <label class="sw"><input type="checkbox" id="saOn"> sliced</label>
+    <span>slice <input type="number" id="saSize" class="num" min="256" max="8192" step="64"> px</span>
+    <span>overlap <input type="number" id="saOv" class="num" min="0" max="0.8" step="0.05"></span>
+    <button id="saApply" class="btn ghost sm">Apply</button>
+    <button id="saRec" class="btn sm" title="Pick a slice size from the current image dimensions">★ Recommended</button>
+    <span id="saMsg" class="muted"></span>
+  </div>
+  <div id="prog"></div>
   <div class="kpis" id="kpis"></div>
   <div class="grid" id="grid"></div>
 </div>
@@ -377,6 +581,23 @@ function render(d){
  const setb=(id,ok,txt)=>{const e=document.getElementById(id);e.className='badge '+(ok?'up':'down');e.textContent=txt+(ok?' ● up':' ● down');};
  setb('ls',d.ls_health,'Label Studio'); setb('ml',d.ml_health,'ML backend');
  const v=document.getElementById('ver'); if(d.serving){v.style.display='';v.textContent='● serving '+d.model_version;}else{v.style.display='none';}
+ // SAHI sliced-inference indicator
+ const si=d.inference||{}, sb=document.getElementById('sahi');
+ if(si.sliced===true){ sb.style.display=''; sb.className='badge up'; sb.textContent='SAHI ● sliced '+si.slice+'px / '+Math.round((si.overlap||0)*100)+'% overlap'; }
+ else if(si.sliced===false){ sb.style.display=''; sb.className='badge down'; sb.textContent='SAHI ○ off (single pass)'; }
+ else { sb.style.display='none'; }
+
+ // ---- live progress banner (training / inference) ----
+ const pg=d.progress||{}; let plive='';
+ if(pg.train){const t=pg.train,pc=t.epochs?Math.min(100,t.epoch/t.epochs*100):0;
+   plive+=`<div class="pcard"><div class="top"><span class="live-dot"></span><b>Training</b> · run #${t.run} <span class="muted">· from scratch</span><span class="pct">${pc.toFixed(0)}%</span></div>
+     <div class="pbar"><div style="width:${pc}%"></div></div>
+     <div class="sub"><span>epoch ${t.epoch} / ${t.epochs}</span>${t.images!=null?`<span>${t.images} images</span>`:''}${t.train_loss!=null?`<span>train loss ${t.train_loss}</span>`:''}${t.val_loss!=null?`<span>val loss ${t.val_loss}</span>`:''}${t.best_val!=null?`<span>best ${t.best_val}</span>`:''}</div></div>`;}
+ if(pg.infer){const t=pg.infer,pc=t.total?Math.min(100,t.done/t.total*100):0;
+   plive+=`<div class="pcard"><div class="top"><span class="live-dot"></span><b>Predicting</b> <span class="muted">· serving boxes to Label Studio</span><span class="pct">${pc.toFixed(0)}%</span></div>
+     <div class="pbar infer"><div style="width:${pc}%"></div></div>
+     <div class="sub"><span>${t.done} / ${t.total} tasks</span>${t.version?`<span>${t.version}</span>`:''}</div></div>`;}
+ document.getElementById('prog').innerHTML=plive?`<div class="live">${plive}</div>`:'';
 
  const ev=d.events_since_train,every=d.retrain_every,pct=Math.min(100,ev/every*100);
  const runs=d.runs||[],pc=d.per_class||{};
@@ -396,7 +617,7 @@ function render(d){
   <div class="kpi"><h3>Annotated images</h3><div class="v">${fmt(d.annotated_images)}</div>
     <div class="s">${fmt(d.total_annotations)} annotations · <a href="http://${location.hostname}:${d.ls_port}" target="_blank">open LS →</a></div></div>
   <div class="kpi"><h3>Predictions in LS</h3><div class="v">${fmt(d.total_predictions)}<small> / ${fmt(d.tasks)}</small></div>
-    <div class="s">auto-predict ${d.auto_predict==null?'—':(d.auto_predict?'<span style="color:var(--ok)">ON</span>':'<span style="color:var(--warn)">OFF</span>')}</div></div>
+    <div class="s">auto-predict ${d.auto_predict==null?'—':(d.auto_predict?'<span style="color:var(--ok)">ON</span>':'<span style="color:var(--warn)">OFF</span>')} · inference: ${si.sliced===true?`<span style="color:var(--ok)">SAHI ${si.slice}px</span>`:(si.sliced===false?'single-pass':'—')}</div></div>
   <div class="kpi"><h3>Training runs</h3><div class="v">${d.train_runs}</div>
     <div class="s">variant <b>${d.variant}</b> · from scratch</div></div>
   <div class="kpi"><h3>Best val loss</h3><div class="v">${last.best_val_loss!=null?last.best_val_loss.toFixed(3):'—'}${trend}</div>
@@ -462,9 +683,58 @@ function render(d){
  const lg=document.getElementById('log'); if(lg){lg.textContent=d.log_tail||'(no log yet)';lg.scrollTop=lg.scrollHeight;}
 }
 
+let ACTMSG_T=null;
+function actmsg(t){ const e=document.getElementById('actmsg'); e.textContent=t;
+  if(ACTMSG_T) clearTimeout(ACTMSG_T); ACTMSG_T=setTimeout(()=>{e.textContent='';},6000); }
+async function post(url){ try{ const r=await fetch(url,{method:'POST'}); return await r.json(); }catch(e){ return {ok:false,error:String(e)}; } }
+document.getElementById('btnTrain').onclick=async()=>{
+  if(!confirm('Start a full from-scratch training run now? This uses the GPU for a few minutes. Predictions auto-update in Label Studio when it finishes.')) return;
+  actmsg('starting training…'); const r=await post('/api/train');
+  actmsg(r.ok?'✓ training started — watch the progress bar above':'✗ '+(r.error||'failed'));
+};
+document.getElementById('btnRefresh').onclick=async()=>{
+  actmsg('refreshing predictions…'); const r=await post('/api/refresh');
+  actmsg(r.ok?'✓ '+(r.status||'refreshing predictions in Label Studio'):'✗ '+(r.error||'failed'));
+};
+function updateButtons(d){
+  const training=!!(d.progress&&d.progress.train);
+  const bt=document.getElementById('btnTrain'), br=document.getElementById('btnRefresh');
+  bt.disabled=training; bt.textContent=training?'⏳ training…':'⚡ Force train now';
+  br.disabled=!d.serving;
+}
+let SA_T=null;
+function saMsg(t){ const e=document.getElementById('saMsg'); e.textContent=t;
+  if(SA_T) clearTimeout(SA_T); SA_T=setTimeout(()=>{e.textContent='';},8000); }
+async function postJSON(url,obj){ try{
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj||{})});
+  return await r.json(); }catch(e){ return {ok:false,error:String(e)}; } }
+function syncSahi(d){               // reflect server config, but never clobber a field being edited
+  const inf=d.inference||{}, on=document.getElementById('saOn'), sz=document.getElementById('saSize'), ov=document.getElementById('saOv');
+  if(document.activeElement!==on) on.checked=inf.sliced!==false;
+  if(document.activeElement!==sz) sz.value=inf.slice??1024;
+  if(document.activeElement!==ov) ov.value=inf.overlap??0.2;
+}
+document.getElementById('saApply').onclick=async()=>{
+  const body={sliced:document.getElementById('saOn').checked,
+              slice:+document.getElementById('saSize').value,
+              overlap:+document.getElementById('saOv').value};
+  saMsg('saving…'); const r=await postJSON('/api/sahi',body);
+  saMsg(r.ok?('✓ saved: '+(r.inference.sliced?('sliced '+r.inference.slice+'px / '+Math.round(r.inference.overlap*100)+'%'):'single-pass')+' — applies to next prediction; click "Refresh predictions" to re-push now')
+            :'✗ '+(r.error||'failed'));
+};
+document.getElementById('saRec').onclick=async()=>{
+  saMsg('measuring images…'); const r=await postJSON('/api/sahi/recommend',{});
+  if(r.ok){ const i=r.inference;
+    document.getElementById('saOn').checked=i.sliced!==false;
+    document.getElementById('saSize').value=i.slice;
+    document.getElementById('saOv').value=i.overlap;
+    const m=r.median_image?(' from '+r.median_image[0]+'×'+r.median_image[1]+' images'):'';
+    saMsg('★ recommended + applied: '+(i.sliced?('sliced '+i.slice+'px'+m):'single-pass (small images)')+' — click "Refresh predictions" to re-push');
+  } else saMsg('✗ '+(r.error||'failed')); };
 async function tick(){
  let d; try{ d=await (await fetch('/api/status')).json() }catch(e){ return }
  LAST=d; document.getElementById('upd').textContent='updated '+new Date().toLocaleTimeString();
+ updateButtons(d); syncSahi(d);
  const sig=JSON.stringify(d);            // skip re-render when nothing changed (keeps dropdown stable while idle)
  if(sig!==LASTSIG){ LASTSIG=sig; render(d); }
 }
@@ -472,6 +742,21 @@ tick(); setInterval(tick,3000);
 </script></body></html>
 """
 
+def _lan_ip():
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "localhost"
+
+
 if __name__ == "__main__":
-    print(f"Dashboard on http://localhost:{DASH_PORT}  (LS={LS_URL}, ML={ML_URL})")
+    ip = _lan_ip()
+    print(f"Dashboard — served on the local network (LS={LS_URL}, ML={ML_URL})")
+    print(f"  this machine : http://localhost:{DASH_PORT}")
+    print(f"  on your LAN  : http://{ip}:{DASH_PORT}")
     app.run(host="0.0.0.0", port=DASH_PORT, debug=False, use_reloader=False)
