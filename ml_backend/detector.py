@@ -30,6 +30,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision.ops import nms
 
+import progress
 from device_util import device_label, get_device
 from model_arch import DEFAULT_ANCHORS, STRIDE, build_model
 from trainlog import get_logger
@@ -42,6 +43,8 @@ PROJECT_DIR = BACKEND_DIR.parent
 DATA_DIR = PROJECT_DIR / "data"
 CKPT_DIR = DATA_DIR / "checkpoints"
 STATE_PATH = DATA_DIR / "state.json"
+HISTORY_PATH = DATA_DIR / "history.json"   # structured per-run training history
+HISTORY_MAX_RUNS = 200                     # keep the most recent N runs
 
 # ---- knobs (env-overridable) ---------------------------------------------- #
 IMG_SIZE = int(os.getenv("DET_IMG_SIZE", "512"))
@@ -58,7 +61,8 @@ def load_state() -> dict:
     if STATE_PATH.exists():
         return json.loads(STATE_PATH.read_text())
     return {
-        "annotations_seen": 0,
+        "annotations_seen": 0,        # distinct images with annotations (info only)
+        "events_since_train": 0,      # annotation submits/edits since last training
         "last_trained_at": 0,
         "train_runs": 0,
         "active_weights": None,
@@ -71,6 +75,29 @@ def load_state() -> dict:
 def save_state(state: dict) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     STATE_PATH.write_text(json.dumps(state, indent=2))
+
+
+# --------------------------------------------------------------------------- #
+# Structured training history (one record per run, with full per-epoch curves)
+# --------------------------------------------------------------------------- #
+def load_history() -> list[dict]:
+    if HISTORY_PATH.exists():
+        try:
+            return json.loads(HISTORY_PATH.read_text(encoding="utf-8")).get("runs", [])
+        except Exception:
+            return []
+    return []
+
+
+def append_history(record: dict) -> None:
+    """Append one run record and atomically rewrite history.json (capped)."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    runs = load_history()
+    runs.append(record)
+    runs = runs[-HISTORY_MAX_RUNS:]
+    tmp = HISTORY_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"runs": runs}, indent=2), encoding="utf-8")
+    tmp.replace(HISTORY_PATH)
 
 
 # --------------------------------------------------------------------------- #
@@ -262,6 +289,7 @@ def train(samples, classes, state, variant=None):
     nc = len(classes)
     run_no = state["train_runs"] + 1
     t_start = time.time()
+    started_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     train_s, val_s = _split(samples)
 
@@ -303,6 +331,11 @@ def train(samples, classes, state, variant=None):
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
     best_path = CKPT_DIR / f"scratchdet_{variant}_r{run_no:03d}.pt"
 
+    # per-epoch curves for the structured history
+    hist = {"epoch": [], "train_loss": [], "val_loss": [],
+            "obj": [], "box": [], "cls": [], "lr": []}
+
+    progress.set_train(run_no, 0, epochs, images=n, phase="starting")
     for ep in range(epochs):
         model.train()
         tloss, nb = 0.0, 0
@@ -343,7 +376,18 @@ def train(samples, classes, state, variant=None):
         log.info(f"  run#{run_no} ep {ep:3d}/{epochs} lr={sched.get_last_lr()[0]:.2e} "
                  f"train_loss={tloss:.4f} val_loss={vloss:.4f} "
                  f"obj={parts['obj']:.3f} box={parts['box']:.3f} cls={parts['cls']:.3f}")
+        hist["epoch"].append(ep)
+        hist["train_loss"].append(round(tloss, 5))
+        hist["val_loss"].append(round(vloss, 5))
+        hist["obj"].append(round(float(parts["obj"]), 5))
+        hist["box"].append(round(float(parts["box"]), 5))
+        hist["cls"].append(round(float(parts["cls"]), 5))
+        hist["lr"].append(float(sched.get_last_lr()[0]))
+        progress.set_train(run_no, ep + 1, epochs, images=n,
+                           train_loss=round(tloss, 4), val_loss=round(vloss, 4),
+                           best_val=round(best_val, 4))
 
+    progress.clear_train()
     dur = time.time() - t_start
     log.info(f"TRAIN RUN #{run_no} DONE  best_val_loss={best_val:.4f} @ep{best_ep} "
              f"| {len(samples)} images | {dur:.1f}s | ckpt={best_path.name}")
@@ -357,6 +401,31 @@ def train(samples, classes, state, variant=None):
     state["last_metrics"] = {"best_val_loss": best_val, "images": n,
                              "epochs": epochs, "duration_s": round(dur, 1)}
     save_state(state)
+
+    # ---- persist the full structured run record ---------------------------- #
+    append_history({
+        "run": run_no,
+        "started_at": started_iso,
+        "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "variant": variant,
+        "device": device_label(device),
+        "images": n,
+        "train_images": len(train_s),
+        "val_images": len(val_s),
+        "total_boxes": total_boxes,
+        "per_class": per_class,
+        "classes": list(classes),
+        "img_size": IMG_SIZE,
+        "batch": BATCH,
+        "epochs": epochs,
+        "lr": LR,
+        "anchors": len(DEFAULT_ANCHORS),
+        "best_val_loss": round(best_val, 5),
+        "best_epoch": best_ep,
+        "duration_s": round(dur, 1),
+        "checkpoint": best_path.name,
+        "curve": hist,
+    })
     return state
 
 

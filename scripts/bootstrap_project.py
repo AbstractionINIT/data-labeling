@@ -119,7 +119,7 @@ def connect_ml_backend(project_id: int):
             headers=H,
             json={
                 "project": project_id,
-                "title": "YOLO11 auto-trainer",
+                "title": "ScratchDet (from-scratch detector)",
                 "url": ML_URL,
                 "is_interactive": False,
             },
@@ -130,25 +130,31 @@ def connect_ml_backend(project_id: int):
         ml_id = r.json()["id"]
         print(f"Connected ML backend id={ml_id}")
 
-    # Enable training on each annotation submit (this is what fires fit()).
-    patch = requests.patch(
+    # Training-on-submit: connecting an ML backend AUTO-CREATES a webhook
+    # (send_for_all_actions=true) that POSTs annotation events to the backend's
+    # /webhook -> fit(). So training already fires; this PATCH is a best-effort
+    # extra for older LS versions and is harmless if the field doesn't exist.
+    requests.patch(
         f"{LS_URL}/api/ml/{ml_id}",
         headers=H,
         json={"start_training_on_annotation_update": True},
         timeout=30,
     )
-    if patch.ok:
-        print("Enabled 'start training on annotation submit'.")
+    # Verify the training webhook exists (this is what actually drives retraining).
+    wh = requests.get(f"{LS_URL}/api/webhooks/", headers=H,
+                      params={"project": project_id}, timeout=30)
+    if wh.ok and any(ML_URL in (w.get("url") or "") for w in wh.json()):
+        print("Training webhook is active -> model retrains on annotation submit.")
     else:
-        print(
-            "NOTE: could not auto-enable training-on-submit via API. "
-            "Turn it on manually in Project > Settings > Model."
-        )
-    # Enable pre-annotations from the model.
+        print("WARNING: no webhook to the ML backend was found; retraining may "
+              "not fire automatically. Check Project > Settings > Webhooks.")
+    # Show model pre-annotations AND auto-fetch them from the backend when a task
+    # loads, so predictions appear without a manual "Retrieve Predictions" step.
     requests.patch(
         f"{LS_URL}/api/projects/{project_id}",
         headers=H,
-        json={"show_collab_predictions": True},
+        json={"show_collab_predictions": True,
+              "evaluate_predictions_automatically": True},
         timeout=30,
     )
 

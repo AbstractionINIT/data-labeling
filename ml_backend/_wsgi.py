@@ -18,7 +18,15 @@ from label_studio_ml.api import init_app
 
 from model import ScratchDetBackend
 
-app = init_app(model_class=ScratchDetBackend)
+# model_dir is where label-studio-ml stores per-job working dirs; it must be a
+# real path or the webhook/training job manager crashes (_job_dir on None).
+MODEL_DIR = os.getenv(
+    "MODEL_DIR",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "ml_jobs"),
+)
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+app = init_app(model_class=ScratchDetBackend, model_dir=MODEL_DIR)
 
 if __name__ == "__main__":
     port = int(os.getenv("ML_PORT", "9090"))

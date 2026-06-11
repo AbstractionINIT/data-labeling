@@ -28,6 +28,9 @@ predictions back as pre-annotations.
 - **Full training log** — every run records start time, data size, per-image
   annotation counts, per-epoch losses, and a summary; capped at 2 GB with
   automatic rotation.
+- **Live dashboard** (http://localhost:9091) — service health, retrain progress,
+  annotated-image + per-class counts, a val-loss curve, checkpoints, and the live
+  training log, all auto-refreshing.
 
 ---
 

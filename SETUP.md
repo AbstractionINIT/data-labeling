@@ -24,8 +24,29 @@ bash setup.sh
 # force a path if needed:   GPU_VENDOR=amd bash setup.sh
 ```
 
-Then do the manual bits that need your input: **steps 5–8** (paste your Label
-Studio token, start the two servers, bootstrap the project).
+Then run the **zero-browser one-command setup** (creates the account + API token,
+starts Label Studio on **http://localhost:8090** and the ML backend on :9090, and
+bootstraps the project — no clicking required):
+
+```powershell
+.\scripts\auto_setup.ps1
+```
+
+When it finishes, open <http://localhost:8090> (login `admin@local.dev` /
+`Annotate123!`, override via `$env:LS_EMAIL`/`$env:LS_PASSWORD`), open
+**Construction Site Detection**, and start labeling. The ML backend is already
+connected and retrains every 25 submissions.
+
+> This project runs on **port 8090** with its **own database** (`data\.ls-data`)
+> so it never collides with another Label Studio you run on 8080.
+>
+> Heads-up if you've used Label Studio before: a leftover user/registry variable
+> `LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT` can override the images folder. The
+> start script sets the correct value for its own process, so you don't need to
+> touch the registry.
+
+If you'd rather do it manually instead of `auto_setup.ps1`, follow **steps 5–8**
+below (paste your Label Studio token, start the two servers, bootstrap).
 
 > AMD note: the fast AMD path (ROCm) is **Linux-only** — PyTorch has no ROCm build
 > for Windows. On Windows, AMD GPUs use DirectML (best-effort); for serious AMD

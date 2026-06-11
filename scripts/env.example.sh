@@ -4,7 +4,9 @@
 # !!! EDIT: paste your Label Studio access token below.
 # Get it from Label Studio -> Account & Settings -> Access Token.
 
-export LABEL_STUDIO_URL="http://localhost:8080"
+# This project runs its OWN Label Studio instance on port 8081 with a separate
+# database (data/.ls-data), so it never collides with another LS on 8080.
+export LABEL_STUDIO_URL="http://localhost:8090"
 export LABEL_STUDIO_API_KEY="PASTE_YOUR_TOKEN_HERE"
 export ML_BACKEND_URL="http://localhost:9090"
 

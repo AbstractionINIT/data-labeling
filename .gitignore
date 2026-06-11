@@ -47,3 +47,6 @@ desktop.ini
 # ---- Source images ---------------------------------------------------------
 # The 158 jpegs are ~300 MB; kept out of git history.
 images/
+
+# ---- This project's dedicated Label Studio instance DB ----
+data/.ls-data/

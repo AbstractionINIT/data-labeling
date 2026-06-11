@@ -15,6 +15,8 @@ so a task URL like  /data/local-files/?d=images/foo.jpeg  is mapped directly to
 from __future__ import annotations
 
 import os
+import threading
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import unquote
@@ -24,6 +26,8 @@ from label_studio_ml.model import LabelStudioMLBase
 from PIL import Image
 
 import detector as D
+import extra_data
+import progress
 from trainlog import get_logger
 
 log = get_logger()
@@ -129,34 +133,40 @@ class ScratchDetBackend(LabelStudioMLBase):
         from_name, to_name, _ = self._control()
         model_version = f"scratchdet-r{state.get('train_runs', 0)}"
         predictions = []
-        for task in tasks:
-            local = self._resolve_image((task.get("data") or {}).get("image"))
-            if not local or not Path(local).exists():
-                predictions.append({"result": [], "score": 0.0})
-                continue
-            img = Image.open(local).convert("RGB")
-            w, h = img.size
-            dets = D.predict_boxes(weights, img, conf=0.25, iou=0.45)
-            items, scores = [], []
-            for cls_id, score, x1, y1, x2, y2 in dets:
-                name = classes[cls_id] if cls_id < len(classes) else str(cls_id)
-                items.append({
-                    "from_name": from_name, "to_name": to_name,
-                    "type": "rectanglelabels",
-                    "original_width": w, "original_height": h, "image_rotation": 0,
-                    "value": {
-                        "x": x1 / w * 100, "y": y1 / h * 100,
-                        "width": (x2 - x1) / w * 100, "height": (y2 - y1) / h * 100,
-                        "rotation": 0, "rectanglelabels": [name],
-                    },
-                    "score": score,
+        total = len(tasks)
+        try:
+            for i, task in enumerate(tasks):
+                local = self._resolve_image((task.get("data") or {}).get("image"))
+                if not local or not Path(local).exists():
+                    predictions.append({"result": [], "score": 0.0})
+                    progress.set_infer(i + 1, total, version=model_version)
+                    continue
+                img = Image.open(local).convert("RGB")
+                w, h = img.size
+                dets = D.predict_boxes(weights, img, conf=0.25, iou=0.45)
+                items, scores = [], []
+                for cls_id, score, x1, y1, x2, y2 in dets:
+                    name = classes[cls_id] if cls_id < len(classes) else str(cls_id)
+                    items.append({
+                        "from_name": from_name, "to_name": to_name,
+                        "type": "rectanglelabels",
+                        "original_width": w, "original_height": h, "image_rotation": 0,
+                        "value": {
+                            "x": x1 / w * 100, "y": y1 / h * 100,
+                            "width": (x2 - x1) / w * 100, "height": (y2 - y1) / h * 100,
+                            "rotation": 0, "rectanglelabels": [name],
+                        },
+                        "score": score,
+                    })
+                    scores.append(score)
+                predictions.append({
+                    "result": items,
+                    "score": sum(scores) / len(scores) if scores else 0.0,
+                    "model_version": model_version,
                 })
-                scores.append(score)
-            predictions.append({
-                "result": items,
-                "score": sum(scores) / len(scores) if scores else 0.0,
-                "model_version": model_version,
-            })
+                progress.set_infer(i + 1, total, version=model_version)
+        finally:
+            progress.clear_infer()
         return predictions
 
     # ------------------------------------------------------------------ #
@@ -175,39 +185,68 @@ class ScratchDetBackend(LabelStudioMLBase):
             return {"status": "no_project_id"}
 
         state = D.load_state()
+        forced = event == "START_TRAINING"
 
-        # Log the CURRENT image's annotation that triggered this event.
-        ann = data.get("annotation") if isinstance(data, dict) else None
-        if ann:
-            n_boxes = len([r for r in (ann.get("result") or [])
+        # Count this as one annotation EVENT (a submit or an edit). Retraining
+        # fires every RETRAIN_EVERY events since the last training, so re-labeling
+        # images you've already annotated (e.g. adding new classes) counts too.
+        if event in ("ANNOTATION_CREATED", "ANNOTATION_UPDATED"):
+            ann = data.get("annotation") if isinstance(data, dict) else None
+            n_boxes = len([r for r in ((ann or {}).get("result") or [])
                            if r.get("type") == "rectanglelabels"])
-            log.info(f"EVENT {event}: task {ann.get('task')} submitted with {n_boxes} boxes")
+            verb = "created" if event == "ANNOTATION_CREATED" else "updated"
+            state["events_since_train"] = state.get("events_since_train", 0) + 1
+            D.save_state(state)
+            log.info(f"EVENT {event}: task {(ann or {}).get('task')} {verb} "
+                     f"with {n_boxes} boxes "
+                     f"({state['events_since_train']}/{RETRAIN_EVERY} since last train)")
 
-        # Count completed annotations from the authoritative export.
+        events = state.get("events_since_train", 0)
+        if not forced and events < RETRAIN_EVERY:
+            log.info(f"  waiting: {events}/{RETRAIN_EVERY} annotation events since "
+                     f"last train ({RETRAIN_EVERY - events} more to go)")
+            return {"status": "waiting", "events_since_train": events,
+                    "retrain_every": RETRAIN_EVERY}
+
+        # Time to (re)train: pull the full labeled set as the source of truth.
         all_tasks = self._export_annotated_tasks(project_id)
         samples = self._tasks_to_samples(all_tasks)
+
+        # Merge any pre-existing annotations dropped into extra_data/ (deduped by
+        # filename; Label Studio annotations win over the dropped-in copy).
+        try:
+            seen = {Path(s["image_path"]).name.lower() for s in samples}
+            added = 0
+            for s in extra_data.load_extra_samples(log=log):
+                key = Path(s["image_path"]).name.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                samples.append(s)
+                added += 1
+            if added:
+                log.info(f"  merged {added} pre-annotated image(s) from extra_data/")
+        except Exception as e:
+            log.warning(f"  extra_data merge failed: {e}")
+
         completed = len(samples)
         state["annotations_seen"] = completed
-        D.save_state(state)
-
-        forced = event == "START_TRAINING"
-        crossed = completed > 0 and (completed // RETRAIN_EVERY) > (
-            state["last_trained_at"] // RETRAIN_EVERY)
-        if not forced and not crossed:
-            nxt = (completed // RETRAIN_EVERY + 1) * RETRAIN_EVERY
-            log.info(f"  progress: {completed} annotated images; next retrain at {nxt}")
-            return {"status": "waiting", "completed": completed, "next_train_at": nxt}
 
         _, _, classes = self._control(project_id)
         if not classes or completed == 0:
+            log.info("  skipped: no classes or no labeled data yet")
+            D.save_state(state)
             return {"status": "skipped", "reason": "no classes or no labeled data"}
 
-        log.info(f"TRIGGER: {completed} annotated images is a multiple of "
-                 f"{RETRAIN_EVERY} (forced={forced}) -> training from scratch")
+        log.info(f"TRIGGER: {events} annotation events reached {RETRAIN_EVERY} "
+                 f"(forced={forced}) -> training from scratch on {completed} images")
         state = D.train(samples, classes, state)
+        state["events_since_train"] = 0          # reset the counter after training
+        D.save_state(state)
         return {
             "status": "trained",
             "images": completed,
+            "events": events,
             "classes": classes,
             "metrics": state["last_metrics"],
             "weights": state["active_weights"],

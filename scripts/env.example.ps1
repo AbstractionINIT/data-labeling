@@ -4,7 +4,9 @@
 # !!! EDIT THIS: paste your Label Studio access token below.
 # Get it from Label Studio  ->  Account & Settings  ->  Access Token  (or Legacy Token).
 
-$env:LABEL_STUDIO_URL     = "http://localhost:8080"
+# This project runs its OWN Label Studio instance on port 8081 with a separate
+# database (data\.ls-data), so it never collides with any other LS you run on 8080.
+$env:LABEL_STUDIO_URL     = "http://localhost:8090"
 $env:LABEL_STUDIO_API_KEY = "PASTE_YOUR_TOKEN_HERE"
 $env:ML_BACKEND_URL       = "http://localhost:9090"
 
@@ -16,8 +18,9 @@ $env:DET_BATCH    = "8"       # fits 8 GB VRAM at 512
 $env:DET_EPOCHS   = "0"       # 0 = auto-scale epochs by dataset size
 $env:DET_LR       = "2e-3"
 
-# Let the ML backend resolve local-storage images that LS serves.
-$env:LABEL_STUDIO_HOST = $env:LABEL_STUDIO_URL
+# NOTE: do NOT set LABEL_STUDIO_HOST here. It must equal the server's own
+# host:port or the UI loads CSS/JS from the wrong port (blank/unstyled page).
+# The start script sets it correctly for the 8081 instance.
 
 Write-Host "Env loaded. LS=$($env:LABEL_STUDIO_URL)  ML=$($env:ML_BACKEND_URL)  retrain every $($env:RETRAIN_EVERY)."
 if ($env:LABEL_STUDIO_API_KEY -eq "PASTE_YOUR_TOKEN_HERE") {

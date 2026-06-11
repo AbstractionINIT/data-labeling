@@ -14,3 +14,7 @@ requests>=2.31.0
 PyYAML>=6.0
 pillow>=10.0
 numpy>=1.26
+# Serve Label Studio with a concurrency-capable server (avoids the SQLite
+# "Cannot operate on a closed database" crash from Django's dev server) + static.
+waitress>=3.0
+whitenoise>=6.0
