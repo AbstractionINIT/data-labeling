@@ -130,12 +130,25 @@ class ScratchDetBackend(LabelStudioMLBase):
         if not weights or not Path(weights).exists():
             return []   # no model yet -> annotate from blank
 
+        # Generation can be paused from the dashboard. When paused, generate
+        # nothing — so deleting predictions in Label Studio (which makes LS call
+        # back here to re-fetch) won't silently regenerate them.
+        if D.load_inference().get("paused"):
+            log.info("  prediction generation is PAUSED (dashboard); skipping")
+            return []
+
         from_name, to_name, _ = self._control()
         model_version = f"scratchdet-r{state.get('train_runs', 0)}"
         predictions = []
         total = len(tasks)
         try:
             for i, task in enumerate(tasks):
+                inf = D.load_inference()       # live config (dashboard-adjustable)
+                # Re-check each task so a pause clicked mid-run halts generation.
+                if inf.get("paused"):
+                    log.info(f"  generation PAUSED from dashboard; stopping at "
+                             f"{i}/{total} tasks")
+                    break
                 local = self._resolve_image((task.get("data") or {}).get("image"))
                 if not local or not Path(local).exists():
                     predictions.append({"result": [], "score": 0.0})
@@ -143,15 +156,20 @@ class ScratchDetBackend(LabelStudioMLBase):
                     continue
                 img = Image.open(local).convert("RGB")
                 w, h = img.size
-                inf = D.load_inference()       # live SAHI config (dashboard-adjustable)
-                dets = (D.predict_boxes_sliced(weights, img, conf=0.25, iou=0.45,
+                conf0 = float(inf.get("conf", 0.25))
+                cc = inf.get("class_conf") or {}
+                # detect down to the lowest active threshold, then filter per class
+                base = max(0.01, min([conf0] + [float(v) for v in cc.values()]))
+                dets = (D.predict_boxes_sliced(weights, img, conf=base, iou=0.45,
                                                slice_size=int(inf["slice"]),
                                                overlap=float(inf["overlap"]))
                         if inf.get("sliced") else
-                        D.predict_boxes(weights, img, conf=0.25, iou=0.45))
+                        D.predict_boxes(weights, img, conf=base, iou=0.45))
                 items, scores = [], []
                 for cls_id, score, x1, y1, x2, y2 in dets:
                     name = classes[cls_id] if cls_id < len(classes) else str(cls_id)
+                    if score < float(cc.get(name, conf0)):   # per-class threshold
+                        continue
                     items.append({
                         "from_name": from_name, "to_name": to_name,
                         "type": "rectanglelabels",
@@ -173,6 +191,17 @@ class ScratchDetBackend(LabelStudioMLBase):
         finally:
             progress.clear_infer()
         return predictions
+
+    # ------------------------------------------------------------------ #
+    # Event dispatch
+    # ------------------------------------------------------------------ #
+    # The base class only routes its built-in TRAIN_EVENTS (ANNOTATION_*) to
+    # fit(); a forced "START_TRAINING" (from the dashboard button / force_train.py)
+    # is otherwise dropped. Handle it explicitly so manual retrains actually run.
+    def process_event(self, event, data, job_id, additional_params):
+        if event == "START_TRAINING":
+            return self.fit((), event=event, data=data, job_id=job_id, **additional_params)
+        return super().process_event(event, data, job_id, additional_params)
 
     # ------------------------------------------------------------------ #
     # Training (triggered by /webhook on every annotation event)
@@ -213,58 +242,70 @@ class ScratchDetBackend(LabelStudioMLBase):
             return {"status": "waiting", "events_since_train": events,
                     "retrain_every": RETRAIN_EVERY}
 
-        # Time to (re)train: pull the full labeled set as the source of truth.
-        all_tasks = self._export_annotated_tasks(project_id)
-        samples = self._tasks_to_samples(all_tasks)
-
-        # Merge any pre-existing annotations dropped into extra_data/ (deduped by
-        # filename; Label Studio annotations win over the dropped-in copy).
+        # Only one training at a time. Training runs in the job manager's
+        # subprocess, so an in-process lock can't guard it — use the shared
+        # training heartbeat instead (fresh heartbeat = a run is active).
+        if progress.train_is_active(60):
+            log.info("  a training run is already in progress; ignoring this trigger")
+            return {"status": "already_training"}
+        progress.set_train(0, 0, 1, phase="preparing")   # claim the slot immediately
         try:
-            seen = {Path(s["image_path"]).name.lower() for s in samples}
-            added = 0
-            for s in extra_data.load_extra_samples(log=log):
-                key = Path(s["image_path"]).name.lower()
-                if key in seen:
-                    continue
-                seen.add(key)
-                samples.append(s)
-                added += 1
-            if added:
-                log.info(f"  merged {added} pre-annotated image(s) from extra_data/")
-        except Exception as e:
-            log.warning(f"  extra_data merge failed: {e}")
+            # Pull the full labeled set as the source of truth.
+            all_tasks = self._export_annotated_tasks(project_id)
+            samples = self._tasks_to_samples(all_tasks)
 
-        completed = len(samples)
-        state["annotations_seen"] = completed
+            # Merge any pre-existing annotations dropped into extra_data/ (deduped
+            # by filename; Label Studio annotations win over the dropped-in copy).
+            try:
+                seen = {Path(s["image_path"]).name.lower() for s in samples}
+                added = 0
+                for s in extra_data.load_extra_samples(log=log):
+                    key = Path(s["image_path"]).name.lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    samples.append(s)
+                    added += 1
+                if added:
+                    log.info(f"  merged {added} pre-annotated image(s) from extra_data/")
+            except Exception as e:
+                log.warning(f"  extra_data merge failed: {e}")
 
-        _, _, classes = self._control(project_id)
-        if not classes or completed == 0:
-            log.info("  skipped: no classes or no labeled data yet")
+            completed = len(samples)
+            state["annotations_seen"] = completed
+
+            _, _, classes = self._control(project_id)
+            if not classes or completed == 0:
+                log.info("  skipped: no classes or no labeled data yet")
+                D.save_state(state)
+                progress.clear_train()
+                return {"status": "skipped", "reason": "no classes or no labeled data"}
+
+            log.info(f"TRIGGER: {events} annotation events reached {RETRAIN_EVERY} "
+                     f"(forced={forced}) -> training from scratch on {completed} images")
+            state = D.train(samples, classes, state)
+            state["events_since_train"] = 0          # reset the counter after training
             D.save_state(state)
-            return {"status": "skipped", "reason": "no classes or no labeled data"}
 
-        log.info(f"TRIGGER: {events} annotation events reached {RETRAIN_EVERY} "
-                 f"(forced={forced}) -> training from scratch on {completed} images")
-        state = D.train(samples, classes, state)
-        state["events_since_train"] = 0          # reset the counter after training
-        D.save_state(state)
+            # Push the fresh model's predictions into Label Studio automatically:
+            # point the project at the new version and re-fetch every task. Done in
+            # a background thread so this webhook returns first (the re-fetch calls
+            # back into /predict on this same backend).
+            version = f"scratchdet-r{state.get('train_runs', 0)}"
+            self._spawn_refresh(project_id, version)
 
-        # Push the fresh model's predictions into Label Studio automatically:
-        # point the project at the new version and re-fetch every task. Done in a
-        # background thread so this webhook returns first (the re-fetch calls back
-        # into /predict on this same backend).
-        version = f"scratchdet-r{state.get('train_runs', 0)}"
-        self._spawn_refresh(project_id, version)
-
-        return {
-            "status": "trained",
-            "images": completed,
-            "events": events,
-            "classes": classes,
-            "metrics": state["last_metrics"],
-            "weights": state["active_weights"],
-            "model_version": version,
-        }
+            return {
+                "status": "trained",
+                "images": completed,
+                "events": events,
+                "classes": classes,
+                "metrics": state["last_metrics"],
+                "weights": state["active_weights"],
+                "model_version": version,
+            }
+        except Exception:
+            progress.clear_train()   # release the guard if training errors out
+            raise
 
     # ------------------------------------------------------------------ #
     # Auto-refresh predictions in Label Studio after a retrain

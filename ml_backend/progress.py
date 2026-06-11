@@ -52,3 +52,12 @@ def set_infer(done: int, total: int, **extra) -> None:
 
 def clear_infer() -> None:
     d = _read(); d.pop("infer", None); _write(d)
+
+
+def train_is_active(stale: float = 60.0) -> bool:
+    """True if a training heartbeat was written within `stale` seconds. Works
+    across processes/subprocesses (the job manager runs training in a subprocess,
+    so an in-process lock can't guard it). Self-heals if a run dies (heartbeat
+    goes stale)."""
+    t = _read().get("train")
+    return bool(t and (time.time() - t.get("updated", 0) < stale))

@@ -220,17 +220,28 @@ def load_extra_samples(log=None) -> list[dict]:
         elif isinstance(doc, dict) and "annotations" in doc and "images" in doc:
             _from_coco(doc, by_name, by_stem, EXTRA_DIR, out, log)
 
+    # Index every .txt / .xml once (so matching is O(n), not a glob per image —
+    # critical for thousands of files).
+    txt_by_stem: dict[str, Path] = {}
+    xml_by_stem: dict[str, Path] = {}
+    for p in EXTRA_DIR.rglob("*"):
+        sfx = p.suffix.lower()
+        if sfx == ".txt":
+            txt_by_stem.setdefault(p.stem, p)
+        elif sfx == ".xml":
+            xml_by_stem.setdefault(p.stem, p)
+
     # Per-image sidecars (YOLO .txt / VOC .xml) matched by stem
     yolo_n = voc_n = 0
     for stem, img_path in by_stem.items():
         txt = img_path.with_suffix(".txt")
         if not txt.exists():
-            txt = next((p for p in EXTRA_DIR.rglob(stem + ".txt")), None)
+            txt = txt_by_stem.get(stem)
         if txt and txt.exists() and txt.name not in {"classes.txt", "names.txt"}:
             yolo_n += _from_yolo_txt(txt, img_path, names, out)
         xml = img_path.with_suffix(".xml")
         if not xml.exists():
-            xml = next((p for p in EXTRA_DIR.rglob(stem + ".xml")), None)
+            xml = xml_by_stem.get(stem)
         if xml and xml.exists():
             voc_n += _from_voc_xml(xml, img_path, out)
     if yolo_n:

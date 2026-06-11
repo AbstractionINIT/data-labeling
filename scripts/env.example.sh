@@ -17,6 +17,8 @@ export DET_IMG_SIZE="512"
 export DET_BATCH="8"
 export DET_EPOCHS="0"          # 0 = auto-scale by dataset size
 export DET_LR="2e-3"
+export DET_WORKERS="0"         # DataLoader workers (0 = main thread; raise to 4
+                              # to speed up loading once the image cache is warm)
 
 # SAHI-style sliced inference — recommended for the large panoramas (~7571x2619):
 # detects on overlapping tiles so small objects aren't lost in the 512px downscale.

@@ -16,6 +16,7 @@ trains on ALL annotations collected so far.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -42,6 +43,7 @@ BACKEND_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BACKEND_DIR.parent
 DATA_DIR = PROJECT_DIR / "data"
 CKPT_DIR = DATA_DIR / "checkpoints"
+CACHE_DIR = DATA_DIR / "cache" / "letterbox"   # cached letterboxed images
 STATE_PATH = DATA_DIR / "state.json"
 HISTORY_PATH = DATA_DIR / "history.json"   # structured per-run training history
 HISTORY_MAX_RUNS = 200                     # keep the most recent N runs
@@ -59,6 +61,8 @@ LR = float(os.getenv("DET_LR", "2e-3"))
 SLICED = os.getenv("DET_SLICED", "1").lower() not in ("0", "", "false", "no", "off")
 SLICE_SIZE = int(os.getenv("DET_SLICE", "1024"))     # tile size in original px
 SLICE_OVERLAP = float(os.getenv("DET_SLICE_OVERLAP", "0.2"))   # 0..1 tile overlap
+CONF = float(os.getenv("DET_CONF", "0.25"))          # default confidence threshold
+WORKERS = int(os.getenv("DET_WORKERS", "0"))         # DataLoader workers (0 = main thread)
 
 
 # --------------------------------------------------------------------------- #
@@ -92,8 +96,14 @@ INFERENCE_PATH = DATA_DIR / "inference.json"
 
 
 def load_inference() -> dict:
-    """Effective sliced-inference config: data/inference.json over env defaults."""
-    cfg = {"sliced": SLICED, "slice": SLICE_SIZE, "overlap": SLICE_OVERLAP}
+    """Effective inference config: data/inference.json over env defaults.
+
+    Keys: sliced/slice/overlap (SAHI), conf (default confidence threshold),
+    class_conf ({class_name: threshold} overrides for individual classes),
+    paused (when True, predict() generates nothing — dashboard-controlled).
+    """
+    cfg = {"sliced": SLICED, "slice": SLICE_SIZE, "overlap": SLICE_OVERLAP,
+           "conf": CONF, "class_conf": {}, "paused": False}
     if INFERENCE_PATH.exists():
         try:
             saved = json.loads(INFERENCE_PATH.read_text(encoding="utf-8"))
@@ -115,6 +125,13 @@ def save_inference(cfg: dict) -> dict:
         cur["slice"] = max(256, min(8192, int(cfg["slice"])))
     if "overlap" in cfg:
         cur["overlap"] = max(0.0, min(0.8, float(cfg["overlap"])))
+    if "conf" in cfg:
+        cur["conf"] = max(0.0, min(1.0, float(cfg["conf"])))
+    if "class_conf" in cfg and isinstance(cfg["class_conf"], dict):
+        cur["class_conf"] = {str(k): max(0.0, min(1.0, float(v)))
+                             for k, v in cfg["class_conf"].items()}
+    if "paused" in cfg:
+        cur["paused"] = bool(cfg["paused"])
     tmp = INFERENCE_PATH.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(cur, indent=2), encoding="utf-8")
     tmp.replace(INFERENCE_PATH)
@@ -196,21 +213,47 @@ def remap_boxes(boxes, r, pad_x, pad_y, ow, oh, size):
 # Dataset
 # --------------------------------------------------------------------------- #
 class DetDataset(Dataset):
-    def __init__(self, samples, class_to_id, size, train=True):
+    def __init__(self, samples, class_to_id, size, train=True, cache=True):
         self.samples = samples
         self.class_to_id = class_to_id
         self.size = size
         self.train = train
+        self.cache = cache
+        if cache:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     def __len__(self):
         return len(self.samples)
 
+    def _letterboxed(self, path):
+        """Letterbox once, then cache the 512x512 array on disk so later epochs
+        skip the expensive open+resize of the full-res image."""
+        if not self.cache:
+            return letterbox(Image.open(path).convert("RGB"), self.size)
+        try:
+            st = os.stat(path)
+            key = hashlib.md5(
+                f"{path}|{int(st.st_mtime)}|{st.st_size}|{self.size}".encode()).hexdigest()
+            f = CACHE_DIR / f"{key}.npz"
+            if f.exists():
+                d = np.load(f)
+                return (d["img"], float(d["r"]), int(d["px"]),
+                        int(d["py"]), int(d["ow"]), int(d["oh"]))
+        except Exception:
+            f = None
+        np_img, r, px, py, ow, oh = letterbox(Image.open(path).convert("RGB"), self.size)
+        if f is not None:
+            try:
+                np.savez(f, img=np_img, r=r, px=px, py=py, ow=ow, oh=oh)
+            except Exception:
+                pass
+        return np_img, r, px, py, ow, oh
+
     def __getitem__(self, idx):
         s = self.samples[idx]
-        img = Image.open(s["image_path"]).convert("RGB")
         boxes = ls_results_to_boxes(s["results"], self.class_to_id)
 
-        np_img, r, px, py, ow, oh = letterbox(img, self.size)
+        np_img, r, px, py, ow, oh = self._letterboxed(s["image_path"])
         boxes = remap_boxes(boxes, r, px, py, ow, oh, self.size)
 
         # Light augmentation: horizontal flip + brightness jitter (train only).
@@ -319,11 +362,16 @@ class DetLoss(nn.Module):
 # --------------------------------------------------------------------------- #
 # Training
 # --------------------------------------------------------------------------- #
-def _split(samples, val_every=5):
-    train, val = [], []
-    for i, s in enumerate(samples):
-        (val if (len(samples) > 4 and i % val_every == 0) else train).append(s)
-    return train, val or train[:1]
+def _split(samples):
+    """Train on ALL samples (maximize data). The returned 'val' set is only a
+    small subset used to monitor val_loss and pick the best checkpoint — those
+    samples are still part of training, i.e. nothing is held out."""
+    train = samples
+    if len(samples) <= 8:
+        return train, samples
+    step = max(1, len(samples) // 60)        # ~60 images just for monitoring
+    val = samples[::step][:60]
+    return train, val
 
 
 def train(samples, classes, state, variant=None):
@@ -355,17 +403,22 @@ def train(samples, classes, state, variant=None):
         name = Path(s['image_path']).name
         k = len(ls_results_to_boxes(s['results'], class_to_id))
         log.info(f"    image {name}: {k} annotations")
+    _dl = {"num_workers": WORKERS}
+    if WORKERS > 0:
+        _dl.update(persistent_workers=True, prefetch_factor=2)
     tr = DataLoader(DetDataset(train_s, class_to_id, IMG_SIZE, train=True),
-                    batch_size=BATCH, shuffle=True, collate_fn=collate, num_workers=0)
+                    batch_size=BATCH, shuffle=True, collate_fn=collate, **_dl)
     va = DataLoader(DetDataset(val_s, class_to_id, IMG_SIZE, train=False),
-                    batch_size=BATCH, shuffle=False, collate_fn=collate, num_workers=0)
+                    batch_size=BATCH, shuffle=False, collate_fn=collate, **_dl)
 
     model = build_model(nc, variant=variant, anchors=DEFAULT_ANCHORS).to(device)
     crit = DetLoss(DEFAULT_ANCHORS, nc, STRIDE, IMG_SIZE).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=5e-4)
 
     n = len(samples)
-    epochs = BASE_EPOCHS or (300 if n < 50 else 200 if n < 150 else 150)
+    # Fewer epochs as the dataset grows (more data converges sooner).
+    epochs = BASE_EPOCHS or (300 if n < 50 else 200 if n < 150 else
+                             150 if n < 600 else 100)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     log.info(f"  settings: img_size={IMG_SIZE} batch={BATCH} epochs={epochs} "
              f"lr={LR} anchors={len(DEFAULT_ANCHORS)}")
@@ -380,10 +433,11 @@ def train(samples, classes, state, variant=None):
             "obj": [], "box": [], "cls": [], "lr": []}
 
     progress.set_train(run_no, 0, epochs, images=n, phase="starting")
+    nbatches = len(tr)
     for ep in range(epochs):
         model.train()
         tloss, nb = 0.0, 0
-        for imgs, targets in tr:
+        for bi, (imgs, targets) in enumerate(tr):
             imgs = imgs.to(device)
             preds = model(imgs)
             loss, parts = crit(preds, targets)
@@ -392,6 +446,14 @@ def train(samples, classes, state, variant=None):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
             opt.step()
             tloss += float(loss); nb += 1
+            # heartbeat so the dashboard shows live progress even within a long
+            # epoch (otherwise the progress bar goes "stale" between epochs).
+            if bi % 5 == 0:
+                frac = (ep + (bi + 1) / max(nbatches, 1)) / max(epochs, 1)
+                el = time.time() - t_start
+                eta = round(el / frac * (1 - frac)) if frac > 0.005 else None
+                progress.set_train(run_no, ep, epochs, images=n, batch=bi + 1,
+                                   batches=nbatches, elapsed_s=round(el), eta_s=eta)
         sched.step()
         tloss /= max(nb, 1)
 
@@ -427,9 +489,12 @@ def train(samples, classes, state, variant=None):
         hist["box"].append(round(float(parts["box"]), 5))
         hist["cls"].append(round(float(parts["cls"]), 5))
         hist["lr"].append(float(sched.get_last_lr()[0]))
+        _frac = (ep + 1) / max(epochs, 1)
+        _el = time.time() - t_start
         progress.set_train(run_no, ep + 1, epochs, images=n,
                            train_loss=round(tloss, 4), val_loss=round(vloss, 4),
-                           best_val=round(best_val, 4))
+                           best_val=round(best_val, 4), elapsed_s=round(_el),
+                           eta_s=round(_el / _frac * (1 - _frac)) if _frac > 0.005 else None)
 
     progress.clear_train()
     dur = time.time() - t_start
